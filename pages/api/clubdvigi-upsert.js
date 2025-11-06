@@ -1,113 +1,283 @@
-// pages/api/clubdvigi-upsert.js
+// pages/api/clubdvgi-upsert.js
+// Upsert de cliente + creación de Metaobjetos `warranty_registration` por cada compra
+// y vinculación al metafield del cliente `custom.registros_de_garantia` (lista de referencias).
+//
+// Requiere en Vercel (Settings → Environment Variables):
+// - SHOPIFY_STORE = dvigiarg.myshopify.com
+// - SHOPIFY_ADMIN_TOKEN = shpat_xxx (Admin API access token)
+//
+// ⚙️ Si en tu Admin cambian los identificadores de campos del metaobjeto,
+//   ajustá las constantes MO_FIELD_* más abajo.
+
+const API_VERSION = '2025-01';
+
+// ====== CORS (cambiá si usás otro dominio de tienda) ======
+const ALLOW_ORIGIN = 'https://dvigiarg.myshopify.com';
+
+// ====== Configuración de Metaobjetos / Metafields ======
+const MO_TYPE = 'warranty_registration';            // handle del tipo de metaobjeto
+// Identificadores EXACTOS de los campos del metaobjeto (handles de cada campo):
+const MO_FIELD_CUSTOMER = 'customer';
+const MO_FIELD_PRODUCT  = 'product';
+const MO_FIELD_PM       = 'purchase_month';
+const MO_FIELD_PY       = 'purchase_year';
+const MO_FIELD_PD       = 'purchase_date';
+const MO_FIELD_EXP      = 'expiry_date';
+
+// Metafield del cliente (lista de referencias a warranty_registration)
+const CUSTOMER_META_NAMESPACE = 'custom';
+const CUSTOMER_META_KEY = 'registros_de_garantia';
+
+// Vida útil del filtro (en meses) para calcular expiry_date
+const MONTHS_TO_EXPIRE = 12;
+
+// ========================================================
+
+function setCORS(res) {
+  res.setHeader('Access-Control-Allow-Origin', ALLOW_ORIGIN);
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+}
+
+function toGid(type, id) {
+  return `gid://shopify/${type}/${id}`;
+}
+
+async function gql(query, variables = {}) {
+  const resp = await fetch(
+    `https://${process.env.SHOPIFY_STORE}/admin/api/${API_VERSION}/graphql.json`,
+    {
+      method: 'POST',
+      headers: {
+        'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query, variables }),
+    }
+  );
+  const json = await resp.json();
+  if (!resp.ok) {
+    throw new Error(
+      `shopify_http_error ${resp.status}: ${JSON.stringify(json)}`
+    );
+  }
+  if (json.errors) {
+    throw new Error(`shopify_graphql_error: ${JSON.stringify(json.errors)}`);
+  }
+  return json.data;
+}
+
+// ---------- GraphQL snippets ----------
+const Q_CUSTOMER_SEARCH = `
+  query($q:String!){
+    customers(first:1, query:$q){
+      edges{ node{ id email firstName lastName phone tags } }
+    }
+  }
+`;
+
+const M_CUSTOMER_CREATE = `
+  mutation($input: CustomerInput!){
+    customerCreate(input:$input){
+      customer{ id }
+      userErrors{ field message }
+    }
+  }
+`;
+
+const M_CUSTOMER_UPDATE = `
+  mutation($input: CustomerInput!){
+    customerUpdate(input:$input){
+      customer{ id tags }
+      userErrors{ field message }
+    }
+  }
+`;
+
+const M_METAOBJECT_CREATE = `
+  mutation($type:String!, $fields:[MetaobjectFieldInput!]!){
+    metaobjectCreate(metaobject:{ type:$type, fields:$fields }){
+      metaobject{ id }
+      userErrors{ field message }
+    }
+  }
+`;
+
+const Q_CUSTOMER_METAFIELD = `
+  query($id:ID!, $ns:String!, $key:String!){
+    customer(id:$id){
+      id
+      metafield(namespace:$ns, key:$key){
+        id
+        type
+        value
+        references(first:250){
+          edges{ node{ id } }
+        }
+      }
+    }
+  }
+`;
+
+const M_METAFIELDS_SET = `
+  mutation($metafields:[MetafieldsSetInput!]!){
+    metafieldsSet(metafields:$metafields){
+      metafields{ id key namespace type value }
+      userErrors{ field message }
+    }
+  }
+`;
+// -------------------------------------
 
 export default async function handler(req, res) {
-  // --- CORS ---
-  res.setHeader('Access-Control-Allow-Origin', '*'); // en prod poné tu dominio
-  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.status(204).end();
+  setCORS(res);
+
+  // Preflight
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
   if (req.method !== 'POST') {
-    return res.status(405).json({ ok: false, error: 'Método no permitido' });
-  }
-
-  // --- ENV ---
-  const SHOPIFY_STORE = process.env.SHOPIFY_STORE;           // ej: midominio.myshopify.com
-  const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN; // shpat_... (Admin API con read_customers)
-  if (!SHOPIFY_STORE || !SHOPIFY_ADMIN_TOKEN) {
-    return res.status(500).json({
-      ok: false,
-      error: 'Faltan SHOPIFY_STORE o SHOPIFY_ADMIN_TOKEN en variables de entorno',
-    });
+    return res.status(405).json({ error: 'method_not_allowed' });
   }
 
   try {
-    // --- BODY ---
-    const body = req.body && typeof req.body === 'object' ? req.body : {};
-    // Campos mínimos recomendados
-    const email = String(body.email || '').trim();
-    const first_name = String(body.first_name || body.nombre || '').trim();
-    const last_name = String(body.last_name || body.apellido || '').trim();
-    const phone = String(body.phone || '').trim();
-    const tags = Array.isArray(body.tags) ? body.tags : (body.tags ? String(body.tags).split(',').map(s => s.trim()).filter(Boolean) : []);
-    const accepts_marketing = Boolean(body.accepts_marketing ?? false);
-    const note = String(body.note || body.nota || '').trim();
+    // 1) Leer payload del front (aceptamos alias de email por compatibilidad)
+    const body = req.body || {};
+    const customerPayload = body.customer || {};
+    const email =
+      customerPayload.email ||
+      body.email ||
+      body.mail ||
+      body.customer_email;
 
     if (!email) {
-      return res.status(400).json({ ok: false, error: 'Falta email' });
+      return res.status(400).json({ error: 'email requerido' });
     }
 
-    const base = `https://${SHOPIFY_STORE}/admin/api/2024-10`;
+    const firstName = customerPayload.first_name || '';
+    const lastName = customerPayload.last_name || '';
+    const phone = customerPayload.phone || null;
 
-    // --- 1) ¿Existe ya un customer con este email? (match exacto)
-    const rExact = await fetch(`${base}/customers.json?email=${encodeURIComponent(email)}`, {
-      headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' },
-      cache: 'no-store',
-    });
+    // 2) Buscar o crear/actualizar cliente
+    const found = await gql(Q_CUSTOMER_SEARCH, { q: `email:${email}` });
+    const existing = found.customers.edges[0]?.node;
 
-    const exactJson = await rExact.json().catch(() => ({}));
-    if (!rExact.ok) {
-      const txt = JSON.stringify(exactJson).slice(0, 500);
-      return res.status(502).json({ ok: false, stage: 'lookup', error: 'SHOPIFY_ERROR', status: rExact.status, details: txt });
-    }
-
-    const customers = Array.isArray(exactJson?.customers) ? exactJson.customers : [];
-    const exists = customers.length > 0;
-    const existing = exists ? customers[0] : null;
-
-    // --- 2) Armar payload de customer
-    const customerPayload = {
-      customer: {
-        email,
-        first_name: first_name || undefined,
-        last_name: last_name || undefined,
-        phone: phone || undefined,
-        tags: tags.length ? tags.join(', ') : undefined,
-        accepts_marketing,
-        note: note || undefined,
-        // Si querés metafields, descomentá y ajustá:
-        // metafields: [
-        //   {
-        //     namespace: 'clubdvigi',
-        //     key: 'serial',
-        //     type: 'single_line_text_field',
-        //     value: String(body.serial || '')
-        //   }
-        // ]
-      }
-    };
-
-    // --- 3) Crear o actualizar
-    if (!exists) {
-      // CREATE
-      const rCreate = await fetch(`${base}/customers.json`, {
-        method: 'POST',
-        headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' },
-        body: JSON.stringify(customerPayload),
+    let customerId;
+    if (!existing) {
+      // Crear con tag clubdvigi
+      const created = await gql(M_CUSTOMER_CREATE, {
+        input: {
+          email,
+          firstName,
+          lastName,
+          phone,
+          tags: ['clubdvigi'],
+        },
       });
-      const createJson = await rCreate.json().catch(() => ({}));
-      if (!rCreate.ok) {
-        const txt = JSON.stringify(createJson).slice(0, 1000);
-        return res.status(502).json({ ok: false, action: 'create', error: 'SHOPIFY_ERROR', status: rCreate.status, details: txt });
+      const errs = created?.customerCreate?.userErrors;
+      if (errs && errs.length) {
+        throw new Error(`customerCreate: ${JSON.stringify(errs)}`);
       }
-      return res.status(201).json({ ok: true, action: 'created', data: createJson.customer || createJson });
+      customerId = created.customerCreate.customer.id;
     } else {
-      // UPDATE
-      const id = existing.id;
-      const rUpdate = await fetch(`${base}/customers/${id}.json`, {
-        method: 'PUT',
-        headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' },
-        body: JSON.stringify(customerPayload),
+      // Actualizar datos + asegurar tag clubdvigi
+      const newTags = Array.from(
+        new Set([...(existing.tags || []), 'clubdvigi'])
+      );
+      const updated = await gql(M_CUSTOMER_UPDATE, {
+        input: {
+          id: existing.id,
+          email,
+          firstName,
+          lastName,
+          phone,
+          tags: newTags,
+        },
       });
-      const updateJson = await rUpdate.json().catch(() => ({}));
-      if (!rUpdate.ok) {
-        const txt = JSON.stringify(updateJson).slice(0, 1000);
-        return res.status(502).json({ ok: false, action: 'update', error: 'SHOPIFY_ERROR', status: rUpdate.status, details: txt });
+      const errs = updated?.customerUpdate?.userErrors;
+      if (errs && errs.length) {
+        throw new Error(`customerUpdate: ${JSON.stringify(errs)}`);
       }
-      return res.status(200).json({ ok: true, action: 'updated', id, data: updateJson.customer || updateJson });
+      customerId = existing.id;
     }
+
+    // 3) Crear metaobjeto por cada compra
+    const purchases = Array.isArray(body.purchases) ? body.purchases : [];
+    const createdMetaobjects = [];
+
+    for (const p of purchases) {
+      if (!p?.product_id || !p?.purchase_month || !p?.purchase_year) continue;
+
+      const month = String(p.purchase_month).padStart(2, '0');
+      const purchase_date = `${p.purchase_year}-${month}-01`;
+
+      const d = new Date(purchase_date);
+      d.setMonth(d.getMonth() + MONTHS_TO_EXPIRE);
+      const expiry_date = d.toISOString().slice(0, 10); // YYYY-MM-DD
+
+      const fields = [
+        { key: MO_FIELD_CUSTOMER, value: customerId },
+        { key: MO_FIELD_PRODUCT, value: toGid('Product', p.product_id) },
+        { key: MO_FIELD_PM, value: String(p.purchase_month) },
+        { key: MO_FIELD_PY, value: String(p.purchase_year) },
+        { key: MO_FIELD_PD, value: purchase_date },
+        { key: MO_FIELD_EXP, value: expiry_date },
+      ];
+
+      const moRes = await gql(M_METAOBJECT_CREATE, {
+        type: MO_TYPE,
+        fields,
+      });
+      const mo = moRes?.metaobjectCreate;
+      if (mo?.userErrors?.length) {
+        throw new Error(`metaobjectCreate: ${JSON.stringify(mo.userErrors)}`);
+      }
+      createdMetaobjects.push(mo.metaobject.id);
+    }
+
+    // 4) Vincular los metaobjetos al cliente en el metafield lista (si hay nuevos)
+    if (createdMetaobjects.length > 0) {
+      const metaQ = await gql(Q_CUSTOMER_METAFIELD, {
+        id: customerId,
+        ns: CUSTOMER_META_NAMESPACE,
+        key: CUSTOMER_META_KEY,
+      });
+
+      const existingRefs =
+        metaQ?.customer?.metafield?.references?.edges?.map((e) => e.node.id) ||
+        [];
+
+      const merged = Array.from(
+        new Set([...existingRefs, ...createdMetaobjects])
+      ).map((id) => ({ id }));
+
+      const setRes = await gql(M_METAFIELDS_SET, {
+        metafields: [
+          {
+            ownerId: customerId,
+            namespace: CUSTOMER_META_NAMESPACE,
+            key: CUSTOMER_META_KEY,
+            type: 'list.metaobject_reference',
+            value: JSON.stringify(merged),
+          },
+        ],
+      });
+
+      const errs = setRes?.metafieldsSet?.userErrors;
+      if (errs && errs.length) {
+        throw new Error(`metafieldsSet: ${JSON.stringify(errs)}`);
+      }
+    }
+
+    // 5) Respuesta OK
+    return res.status(200).json({
+      ok: true,
+      customerId,
+      created: createdMetaobjects,
+    });
   } catch (e) {
-    console.error('[UPSERT] UNCAUGHT:', e);
-    return res.status(500).json({ ok: false, error: 'UNCAUGHT', details: e?.message || 'unknown' });
+    console.error('[clubdvgi-upsert] error', e);
+    return res
+      .status(500)
+      .json({ error: 'server_error', detail: String(e?.message || e) });
   }
 }
