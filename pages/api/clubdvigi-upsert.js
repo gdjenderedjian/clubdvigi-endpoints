@@ -12,7 +12,7 @@
 const API_VERSION = '2025-01';
 
 // ====== CORS (cambiá si usás otro dominio de tienda) ======
-const ALLOW_ORIGIN = 'https://dvigiarg.myshopify.com';
+const ALLOW_ORIGIN = 'https://dvigi.com.ar';
 
 // ====== Configuración de Metaobjetos / Metafields ======
 const MO_TYPE = 'warranty_registration';            // handle del tipo de metaobjeto
