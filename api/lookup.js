@@ -1,50 +1,84 @@
-const API_VERSION = '2025-01';
-
-function setCors(res, origin) {
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Origin', origin || '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-}
+// pages/api/lookup.js
 
 export default async function handler(req, res) {
-  setCors(res, req.headers.origin);
-  if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+  // 🔹 Configurar CORS (para permitir el acceso desde tu formulario en Shopify)
+  res.setHeader('Access-Control-Allow-Origin', '*'); // en prod podés poner tu dominio
+  res.setHeader('Access-Control-Allow-Methods', 'POST,GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+  // 🔹 Responder preflight de CORS
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+
+  // 🔹 Aceptar solo GET o POST
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    return res.status(405).json({ ok: false, error: 'Método no permitido' });
+  }
 
   try {
-    const { email } = req.body || {};
-    if (!email) return res.status(400).json({ error: 'Email requerido' });
+    // 1️⃣ Leer email desde query (GET) o body (POST)
+    let email = '';
+    if (req.method === 'GET') {
+      email = req.query.email || '';
+    } else if (req.method === 'POST') {
+      email = req.body?.email || '';
+    }
 
-    const shop = process.env.SHOPIFY_STORE;
-    const token = process.env.SHOPIFY_ADMIN_TOKEN;
-    if (!shop || !token) return res.status(500).json({ error: 'Faltan variables de entorno' });
+    email = email.trim();
+    if (!email) {
+      return res.status(400).json({ ok: false, error: 'Falta el parámetro email' });
+    }
 
-    const admin = `https://${shop}/admin/api/${API_VERSION}/graphql.json`;
-    const headers = { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' };
+    // 2️⃣ Leer las variables de entorno
+    const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // Ej: clubdvigi.myshopify.com
+    const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN; // Ej: shpat_xxx...
 
-    const query = `
-      query ($q: String!) {
-        customers(first: 1, query: $q) {
-          nodes { id email firstName lastName phone }
-        }
-      }`;
+    if (!SHOPIFY_STORE || !SHOPIFY_ADMIN_TOKEN) {
+      return res.status(500).json({
+        ok: false,
+        error:
+          'Faltan variables de entorno SHOPIFY_STORE o SHOPIFY_ADMIN_TOKEN en Vercel',
+      });
+    }
 
-    const resp = await fetch(admin, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ query, variables: { q: \`email:${email}\` } }),
-    }).then(r => r.json());
+    // 3️⃣ Hacer consulta a Shopify
+    const url = `https://${SHOPIFY_STORE}/admin/api/2024-10/customers/search.json?query=email:${encodeURIComponent(
+      email
+    )}`;
 
-    const c = resp?.data?.customers?.nodes?.[0];
-    if (!c) return res.status(404).json({});
-
-    return res.status(200).json({
-      first_name: c.firstName || '',
-      last_name: c.lastName || '',
-      phone: c.phone || ''
+    const shopifyResponse = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN,
+        'Content-Type': 'application/json',
+      },
     });
-  } catch (e) {
-    return res.status(500).json({ error: e?.message || 'Server error' });
+
+    // 4️⃣ Manejar errores de Shopify
+    if (!shopifyResponse.ok) {
+      const text = await shopifyResponse.text().catch(() => '');
+      return res.status(502).json({
+        ok: false,
+        error: 'Error al consultar Shopify',
+        status: shopifyResponse.status,
+        details: text.slice(0, 300),
+      });
+    }
+
+    // 5️⃣ Enviar respuesta JSON al cliente
+    const data = await shopifyResponse.json();
+    return res.status(200).json({
+      ok: true,
+      found: data.customers?.length > 0,
+      data: data.customers || [],
+    });
+  } catch (error) {
+    console.error('[Lookup error]', error);
+    return res.status(500).json({
+      ok: false,
+      error: 'Error interno del servidor',
+      details: error?.message || 'unknown',
+    });
   }
 }
