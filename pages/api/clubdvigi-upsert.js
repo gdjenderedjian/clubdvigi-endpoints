@@ -1,4 +1,4 @@
-// api/clubdvigi-upsert.js
+// pages/api/clubdvigi-upsert.js
 // Crea o actualiza un cliente en Shopify + guarda productos con garantía (metafield JSON)
 // y agrega tags: clubdvigi, Completó Formulario Web, y opcionalmente clubdvigi_whatsapp
 
