@@ -1,189 +1,113 @@
 // pages/api/clubdvigi-upsert.js
-// Crea o actualiza un cliente en Shopify + guarda productos con garantía (metafield JSON)
-// y agrega tags: clubdvigi, Completó Formulario Web, y opcionalmente clubdvigi_whatsapp
-
-const API_VERSION = '2025-01';
-const NAMESPACE = 'dvigi';
-const KEY_WARRANTY = 'warranty_items';
-
-function setCors(res, origin) {
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Origin', origin || '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-}
 
 export default async function handler(req, res) {
-  setCors(res, req.headers.origin);
-
+  // --- CORS ---
+  res.setHeader('Access-Control-Allow-Origin', '*'); // en prod poné tu dominio
+  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ ok: false, error: 'Método no permitido' });
+  }
+
+  // --- ENV ---
+  const SHOPIFY_STORE = process.env.SHOPIFY_STORE;           // ej: midominio.myshopify.com
+  const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN; // shpat_... (Admin API con read_customers)
+  if (!SHOPIFY_STORE || !SHOPIFY_ADMIN_TOKEN) {
+    return res.status(500).json({
+      ok: false,
+      error: 'Faltan SHOPIFY_STORE o SHOPIFY_ADMIN_TOKEN en variables de entorno',
+    });
+  }
 
   try {
-    const {
-      email,
-      first_name,
-      last_name,
-      whatsapp,
-      notify_channel,
-      product_id,
-      product_handle,
-      product_title,
-      month,
-      year,
-      tags
-    } = req.body || {};
+    // --- BODY ---
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    // Campos mínimos recomendados
+    const email = String(body.email || '').trim();
+    const first_name = String(body.first_name || body.nombre || '').trim();
+    const last_name = String(body.last_name || body.apellido || '').trim();
+    const phone = String(body.phone || '').trim();
+    const tags = Array.isArray(body.tags) ? body.tags : (body.tags ? String(body.tags).split(',').map(s => s.trim()).filter(Boolean) : []);
+    const accepts_marketing = Boolean(body.accepts_marketing ?? false);
+    const note = String(body.note || body.nota || '').trim();
 
-    if (!email) return res.status(400).json({ error: 'Email requerido' });
-
-    const shop = process.env.SHOPIFY_STORE;
-    const token = process.env.SHOPIFY_ADMIN_TOKEN;
-    if (!shop || !token) return res.status(500).json({ error: 'Faltan variables de entorno' });
-
-    const admin = `https://${shop}/admin/api/${API_VERSION}/graphql.json`;
-    const headers = {
-      'X-Shopify-Access-Token': token,
-      'Content-Type': 'application/json'
-    };
-
-    // --- 1. Buscar cliente por email
-    const qSearch = `
-      query($q:String!){
-        customers(first:1, query:$q){
-          nodes{ id email tags }
-        }
-      }`;
-    const search = await fetch(admin, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ query: qSearch, variables: { q: `email:${email}` } })
-    }).then(r => r.json());
-    const found = search?.data?.customers?.nodes?.[0] || null;
-    const existed = !!found;
-
-    // --- 2. Preparar tags
-    const baseTags = Array.isArray(tags) ? tags : [];
-    if (notify_channel === 'whatsapp') baseTags.push('clubdvigi_whatsapp');
-    baseTags.push('clubdvigi', 'Completó Formulario Web');
-    const allTags = Array.from(new Set([...(found?.tags || []), ...baseTags]));
-
-    // --- 3. Crear o actualizar cliente
-    const input = {
-      email,
-      firstName: first_name || undefined,
-      lastName: last_name || undefined,
-      phone: whatsapp || undefined,
-      tags: allTags
-    };
-
-    let customerId = found?.id;
-
-    if (!customerId) {
-      const qCreate = `
-        mutation($input:CustomerInput!){
-          customerCreate(input:$input){
-            customer{ id }
-            userErrors{ message }
-          }
-        }`;
-      const created = await fetch(admin, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ query: qCreate, variables: { input } })
-      }).then(r => r.json());
-      const err = created?.data?.customerCreate?.userErrors?.[0];
-      if (err) return res.status(400).json({ error: err.message });
-      customerId = created?.data?.customerCreate?.customer?.id;
-    } else {
-      const qUpdate = `
-        mutation($id:ID!,$input:CustomerInput!){
-          customerUpdate(id:$id,input:$input){
-            customer{ id }
-            userErrors{ message }
-          }
-        }`;
-      const updated = await fetch(admin, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ query: qUpdate, variables: { id: customerId, input } })
-      }).then(r => r.json());
-      const err = updated?.data?.customerUpdate?.userErrors?.[0];
-      if (err) return res.status(400).json({ error: err.message });
+    if (!email) {
+      return res.status(400).json({ ok: false, error: 'Falta email' });
     }
 
-    // --- 4. Obtener y actualizar metafield de productos con garantía
-    const qGetMF = `
-      query($id:ID!){
-        customer(id:$id){
-          metafield(namespace:"${NAMESPACE}", key:"${KEY_WARRANTY}"){
-            id
-            value
-          }
-        }
-      }`;
-    const curr = await fetch(admin, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ query: qGetMF, variables: { id: customerId } })
-    }).then(r => r.json());
+    const base = `https://${SHOPIFY_STORE}/admin/api/2024-10`;
 
-    let list = [];
-    try {
-      list = curr?.data?.customer?.metafield?.value
-        ? JSON.parse(curr.data.customer.metafield.value)
-        : [];
-    } catch {}
-    if (!Array.isArray(list)) list = [];
+    // --- 1) ¿Existe ya un customer con este email? (match exacto)
+    const rExact = await fetch(`${base}/customers.json?email=${encodeURIComponent(email)}`, {
+      headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' },
+      cache: 'no-store',
+    });
 
-    const entry = {
-      product_id: product_id || '',
-      handle: product_handle || '',
-      title: product_title || '',
-      month,
-      year,
-      recordedAt: new Date().toISOString()
+    const exactJson = await rExact.json().catch(() => ({}));
+    if (!rExact.ok) {
+      const txt = JSON.stringify(exactJson).slice(0, 500);
+      return res.status(502).json({ ok: false, stage: 'lookup', error: 'SHOPIFY_ERROR', status: rExact.status, details: txt });
+    }
+
+    const customers = Array.isArray(exactJson?.customers) ? exactJson.customers : [];
+    const exists = customers.length > 0;
+    const existing = exists ? customers[0] : null;
+
+    // --- 2) Armar payload de customer
+    const customerPayload = {
+      customer: {
+        email,
+        first_name: first_name || undefined,
+        last_name: last_name || undefined,
+        phone: phone || undefined,
+        tags: tags.length ? tags.join(', ') : undefined,
+        accepts_marketing,
+        note: note || undefined,
+        // Si querés metafields, descomentá y ajustá:
+        // metafields: [
+        //   {
+        //     namespace: 'clubdvigi',
+        //     key: 'serial',
+        //     type: 'single_line_text_field',
+        //     value: String(body.serial || '')
+        //   }
+        // ]
+      }
     };
 
-    const duplicate = list.some(
-      x => x.handle === entry.handle && x.month === entry.month && x.year === entry.year
-    );
-    if (!duplicate && (entry.title || entry.handle)) list.push(entry);
-
-    const qSetMF = `
-      mutation($ownerId:ID!,$value:String!){
-        metafieldsSet(metafields:[{
-          ownerId:$ownerId,
-          namespace:"${NAMESPACE}",
-          key:"${KEY_WARRANTY}",
-          type:"json",
-          value:$value
-        }]){
-          userErrors{ message }
-        }
-      }`;
-
-    const saved = await fetch(admin, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        query: qSetMF,
-        variables: { ownerId: customerId, value: JSON.stringify(list) }
-      })
-    }).then(r => r.json());
-
-    const mfErr = saved?.data?.metafieldsSet?.userErrors?.[0];
-    if (mfErr) return res.status(400).json({ error: mfErr.message });
-
-    // --- 5. Respuesta final
-    return res.status(200).json({
-      ok: true,
-      existed,
-      message: existed
-        ? 'Actualizamos tus datos y tu producto en Club Dvigi 💧'
-        : 'Te registramos en Club Dvigi y guardamos tu producto 💙'
-    });
+    // --- 3) Crear o actualizar
+    if (!exists) {
+      // CREATE
+      const rCreate = await fetch(`${base}/customers.json`, {
+        method: 'POST',
+        headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' },
+        body: JSON.stringify(customerPayload),
+      });
+      const createJson = await rCreate.json().catch(() => ({}));
+      if (!rCreate.ok) {
+        const txt = JSON.stringify(createJson).slice(0, 1000);
+        return res.status(502).json({ ok: false, action: 'create', error: 'SHOPIFY_ERROR', status: rCreate.status, details: txt });
+      }
+      return res.status(201).json({ ok: true, action: 'created', data: createJson.customer || createJson });
+    } else {
+      // UPDATE
+      const id = existing.id;
+      const rUpdate = await fetch(`${base}/customers/${id}.json`, {
+        method: 'PUT',
+        headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' },
+        body: JSON.stringify(customerPayload),
+      });
+      const updateJson = await rUpdate.json().catch(() => ({}));
+      if (!rUpdate.ok) {
+        const txt = JSON.stringify(updateJson).slice(0, 1000);
+        return res.status(502).json({ ok: false, action: 'update', error: 'SHOPIFY_ERROR', status: rUpdate.status, details: txt });
+      }
+      return res.status(200).json({ ok: true, action: 'updated', id, data: updateJson.customer || updateJson });
+    }
   } catch (e) {
-    console.error('Error general:', e);
-    return res.status(500).json({ error: e?.message || 'Server error' });
+    console.error('[UPSERT] UNCAUGHT:', e);
+    return res.status(500).json({ ok: false, error: 'UNCAUGHT', details: e?.message || 'unknown' });
   }
 }
