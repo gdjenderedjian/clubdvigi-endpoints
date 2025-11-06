@@ -1,161 +1,102 @@
 // pages/api/lookup.js
+// Busca un cliente por email en Shopify Admin (GraphQL) y devuelve si existe.
+// CORS habilitado para tu tienda. No expone tokens en el front: usa variables de entorno.
+//
+// Requiere en Vercel (Settings → Environment Variables):
+// - SHOPIFY_STORE = dvigiarg.myshopify.com
+// - SHOPIFY_ADMIN_TOKEN = shpat_xxx (Admin API access token)
+
+const API_VERSION = '2025-01';
+const ALLOW_ORIGIN = 'https://dvigiarg.myshopify.com'; // cambiá si usás otro dominio de tienda
+
+function setCORS(res) {
+  res.setHeader('Access-Control-Allow-Origin', ALLOW_ORIGIN);
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+}
 
 export default async function handler(req, res) {
-  // --- CORS ---
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST,GET,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  setCORS(res);
 
-  if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'GET' && req.method !== 'POST') {
-    return res.status(405).json({ ok: false, error: 'Método no permitido' });
-  }
+  // Preflight
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // --- Selftest: revisar ENV ---
-  if (req.method === 'GET' && req.query.selftest === '1') {
-    return res.status(200).json({
-      ok: true,
-      hasStore: !!process.env.SHOPIFY_STORE,
-      hasToken: !!process.env.SHOPIFY_ADMIN_TOKEN,
-    });
-  }
-
-  // --- Checkshop: probar conexión Shopify ---
-  if (req.method === 'GET' && req.query.checkshop === '1') {
-    try {
-      const r = await fetch(`https://${process.env.SHOPIFY_STORE}/admin/api/2024-10/shop.json`, {
-        headers: { 'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN },
-        cache: 'no-store',
-      });
-      const txt = await r.text().catch(() => '');
-      return res.status(200).json({ ok: r.ok, status: r.status, sample: txt.slice(0, 200) });
-    } catch (e) {
-      return res.status(500).json({ ok: false, error: 'CHECKSHOP_FAIL', details: e?.message || 'unknown' });
-    }
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'method_not_allowed' });
   }
 
   try {
-    // --- Normalizador de email ---
-    const extractEmail = (obj = {}) => {
-      const candidates = [
-        'email', 'Email', 'e-mail', 'mail', 'correo', 'correo_electronico',
-        'customer[email]', 'fields[email]', 'contact[email]'
-      ];
-      for (const k of candidates) if (obj[k]) return String(obj[k]).trim();
-      for (const k of Object.keys(obj)) {
-        if (k.toLowerCase().includes('email') && obj[k]) return String(obj[k]).trim();
-      }
-      return '';
-    };
-
-    const emailFromQuery = extractEmail(req.query || {});
-    const emailFromBody = extractEmail(req.body || {});
-    const email = (emailFromBody || emailFromQuery || '').trim();
+    // Admite varios alias por compatibilidad con el front
+    const body = req.body || {};
+    const email =
+      body.email ||
+      body?.customer?.email ||
+      body.mail ||
+      body.customer_email;
 
     if (!email) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Falta el parámetro email',
-        hint: 'Usá ?email=... o enviá JSON {"email":"..."}',
-      });
+      return res.status(400).json({ error: 'email requerido' });
     }
 
-    const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // Ej: clubdvigi.myshopify.com
-    const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN; // shpat_...
-    if (!SHOPIFY_STORE || !SHOPIFY_ADMIN_TOKEN) {
-      return res.status(500).json({ ok: false, error: 'Faltan SHOPIFY_STORE o SHOPIFY_ADMIN_TOKEN' });
+    // Llamada a Shopify GraphQL Admin
+    const resp = await fetch(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/${API_VERSION}/graphql.json`,
+      {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': process.env.SHOPIFY_ADMIN_TOKEN,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: `
+            query($q: String!) {
+              customers(first: 1, query: $q) {
+                edges {
+                  node {
+                    id
+                    email
+                    firstName
+                    lastName
+                    phone
+                    tags
+                  }
+                }
+              }
+            }
+          `,
+          // La sintaxis email: funciona sin comillas
+          variables: { q: `email:${email}` },
+        }),
+      }
+    );
+
+    const json = await resp.json();
+
+    if (!resp.ok) {
+      // Error HTTP
+      return res
+        .status(resp.status)
+        .json({ error: 'shopify_http_error', detail: json });
     }
 
-    const base = `https://${SHOPIFY_STORE}/admin/api/2024-10`;
+    if (json.errors) {
+      // Errores GraphQL de nivel superior
+      return res
+        .status(500)
+        .json({ error: 'shopify_graphql_error', detail: json.errors });
+    }
 
-    // --- 1️⃣ Buscar cliente exacto ---
-    const rExact = await fetch(`${base}/customers.json?email=${encodeURIComponent(email)}`, {
-      headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' },
-      cache: 'no-store',
+    const node = json?.data?.customers?.edges?.[0]?.node || null;
+
+    return res.status(200).json({
+      found: Boolean(node),
+      customer: node, // puede ser null si no existe
     });
-    let exact = [];
-    try { exact = (await rExact.json())?.customers || []; } catch {}
-    if (!rExact.ok) {
-      const t = await rExact.text().catch(() => '');
-      return res.status(502).json({
-        ok: false,
-        where: 'customers_exact',
-        error: 'SHOPIFY_ERROR',
-        status: rExact.status,
-        details: t.slice(0, 500),
-      });
-    }
-    if (exact.length > 0) {
-      return res.status(200).json({
-        ok: true,
-        found: true,
-        where: 'customers_exact',
-        count: exact.length,
-        data: exact,
-      });
-    }
-
-    // --- 2️⃣ Buscar cliente general (search) ---
-    const rSearch = await fetch(`${base}/customers/search.json?query=${encodeURIComponent(`email:${email}`)}`, {
-      headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' },
-      cache: 'no-store',
-    });
-    let search = [];
-    try { search = (await rSearch.json())?.customers || []; } catch {}
-    if (!rSearch.ok) {
-      const t = await rSearch.text().catch(() => '');
-      return res.status(502).json({
-        ok: false,
-        where: 'customers_search',
-        error: 'SHOPIFY_ERROR',
-        status: rSearch.status,
-        details: t.slice(0, 500),
-      });
-    }
-    if (search.length > 0) {
-      return res.status(200).json({
-        ok: true,
-        found: true,
-        where: 'customers_search',
-        count: search.length,
-        data: search,
-      });
-    }
-
-    // --- 3️⃣ Buscar órdenes (checkout como invitado) ---
-    const rOrders = await fetch(`${base}/orders.json?email=${encodeURIComponent(email)}&status=any&limit=5`, {
-      headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' },
-      cache: 'no-store',
-    });
-    let orders = [];
-    try { orders = (await rOrders.json())?.orders || []; } catch {}
-    if (!rOrders.ok) {
-      const t = await rOrders.text().catch(() => '');
-      return res.status(502).json({
-        ok: false,
-        where: 'orders',
-        error: 'SHOPIFY_ERROR',
-        status: rOrders.status,
-        details: t.slice(0, 500),
-      });
-    }
-    if (orders.length > 0) {
-      return res.status(200).json({
-        ok: true,
-        found: false,
-        where: 'orders',
-        note: 'Email visto en órdenes, no en clientes',
-        ordersCount: orders.length,
-        orders,
-      });
-    }
-
-    // --- Nada encontrado ---
-    return res.status(200).json({ ok: true, found: false, where: 'none', data: [] });
-
   } catch (e) {
-    console.error('[LOOKUP] UNCAUGHT:', e);
-    return res.status(500).json({ ok: false, error: 'UNCAUGHT', details: e?.message || 'unknown' });
+    console.error('[lookup] error', e);
+    return res
+      .status(500)
+      .json({ error: 'server_error', detail: String(e?.message || e) });
   }
 }
 
