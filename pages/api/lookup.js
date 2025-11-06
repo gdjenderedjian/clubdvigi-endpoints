@@ -1,4 +1,4 @@
-// app/api/lookup/route.js
+// pages/api/lookup.js
 export const runtime = 'nodejs'; // recomendable si usás libs de Node
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
