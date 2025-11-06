@@ -9,7 +9,7 @@
 // - SHOPIFY_ADMIN_TOKEN = shpat_xxx
 
 const API_VERSION = '2025-01';
-const ALLOW_ORIGIN = 'https://dvigiarg.myshopify.com'; // Cambiá si tu tienda usa dominio propio
+const ALLOW_ORIGIN = 'https://dvigi.com.ar'; // Cambiá si tu tienda usa dominio propio
 
 // Config general
 const MO_TYPE = 'warranty_registration'; // handle del tipo de metaobjeto
